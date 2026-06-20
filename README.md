@@ -186,6 +186,12 @@ class AsyncIndustrialOrchestrator:
                     if isinstance(node.slice, (ast.Constant, ast.Str)): # ast.Constant for Python 3.8+, ast.Str for older
                         if node.slice.value in forbidden_builtins_and_dynamic_access:
                             return False
+
+            # New universal blocker for access to __globals__ and __dict__
+            elif isinstance(node, ast.Attribute):
+                if node.attr in ('__globals__', '__dict__'):
+                    return False
+
         return True
 
     # =====================================================================
@@ -264,21 +270,20 @@ class AsyncIndustrialOrchestrator:
     # =====================================================================
     # АСИНХРОННЫЕ ВЫЗОВЫ АГЕНТОВ (MOCK)
     # =====================================================================
-    async def mock_secured_llm_call(self, agent: str, prompt: str) -> BaseModel:
+    async def mock_secured_llm_call(self, agent: str, prompt: str, current_iteration: int) -> BaseModel:
         # Имитируем сетевую задержку реального вызова API
         await asyncio.sleep(0.1)
 
         if agent == "creator":
-            current_solution_count = len(self.history_creator_solutions)
-            if current_solution_count == 0:
-                # Generate code that exceeds memory limit to test OOMKilled handling
+            # Use current_iteration to determine the mock response progression
+            if current_iteration == 1:
                 return CreatorResponseSchema(
                     version=1,
                     reflection="Старт решения. Создаю тестовый код для проверки OOMKilled.",
                     solution_code="_ = bytearray(70 * 1024 * 1024) # Allocate 70MB to trigger OOM"
                 )
-            elif current_solution_count == 1:
-                # After first feedback (e.g., "Исправь работу с ключами словаря.")
+            elif current_iteration == 2:
+                # After OOM feedback or if a loop was detected on the first non-OOM solution
                 return CreatorResponseSchema(
                     version=2,
                     reflection="Учитываю замечание оппонента. Добавляю метод для безопасной работы с ключами.",
@@ -290,7 +295,8 @@ class AsyncIndustrialOrchestrator:
     async def set(self, key, value):
         self._cache[key] = value"""
                 )
-            else: # current_solution_count >= 2: This will be the final, successful solution
+            else: # current_iteration >= 3
+                # Final solution for subsequent iterations
                 return CreatorResponseSchema(
                     version=3,
                     reflection="Финальное решение с полным асинхронным кэшем и локированием.",
@@ -319,7 +325,7 @@ class AsyncIndustrialOrchestrator:
             print(f"\n--- ИТЕРАЦИЯ №{iteration} ---")
 
             try:
-                creator_res: CreatorResponseSchema = await self.mock_secured_llm_call("creator", creator_input)
+                creator_res: CreatorResponseSchema = await self.mock_secured_llm_call("creator", creator_input, iteration)
                 print(f"🛠 [Творец] Сгенерирован код. Длина: {len(creator_res.solution_code)} симв.")
 
                 # Асинхронный запуск Docker-песочницы для проверки сгенерированного кода
