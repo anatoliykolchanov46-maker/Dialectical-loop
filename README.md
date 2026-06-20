@@ -90,7 +90,9 @@
             return vector / np.linalg.norm(vector)
 
         async def _get_true_embedding(self, text: str) -> np.ndarray:
-            """Асинхронное извлечение семантического вектора."""
+            """
+            Асинхронное извлечение семантического вектора.
+            """
             if self.client.api_key == "mock_key_for_test":
                 return self._generate_deterministic_mock_embedding(text)
 
@@ -115,8 +117,12 @@
             except SyntaxError:
                 return False
 
-            allowed_builtins = {'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'asyncio'}
-            forbidden_modules = {'os', 'subprocess', 'sys', 'shutil', 'pty', 'platform', 'socket'}
+            forbidden_modules = {'os', 'subprocess', 'sys', 'shutil', 'pty', 'platform', 'socket', 'importlib'}
+            # Explicitly forbidden built-in functions when they are called
+            forbidden_builtins_on_call = {'exec', 'eval', '__import__', 'compile'}
+            # Built-in functions that enable dynamic access, forbidden even if just referenced
+            # (as their reference allows later call to bypass static checks)
+            forbidden_dynamic_access_builtins = {'getattr', 'setattr', 'delattr'}
 
             for node in ast.walk(root):
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -124,8 +130,17 @@
                     for alias in names:
                         if alias.name in forbidden_modules or alias.name.split('.')[0] in forbidden_modules:
                             return False
-                elif isinstance(node, ast.Name):
-                    if node.id in ['exec', 'eval', '__import__', 'getattr', 'setattr']:
+                elif isinstance(node, ast.Call):
+                    # Check if the function being called is a forbidden built-in
+                    if isinstance(node.func, ast.Name):
+                        if node.func.id in forbidden_builtins_on_call:
+                            return False
+                    # Check for calls like 'importlib.import_module'
+                    elif isinstance(node.func, ast.Attribute):
+                        if isinstance(node.func.value, ast.Name) and node.func.value.id == 'importlib' and node.func.attr == 'import_module':
+                            return False
+                elif isinstance(node, ast.Name): # Check for direct references to dynamic access functions
+                    if node.ctx == ast.Load and node.id in forbidden_dynamic_access_builtins:
                         return False
             return True
 
@@ -214,7 +229,27 @@
                     return CreatorResponseSchema(
                         version=3,
                         reflection="Финальное решение с полным асинхронным кэшем и локированием.",
-                        solution_code="import asyncio\n\nclass AsyncCache:\n    def __init__(self):\n        self._cache = {}\n        self._lock = asyncio.Lock()\n\n    async def get(self, key):\n        async with self._lock:\n            return self._cache.get(key)\n\n    async def set(self, key, value):\n        async with self._lock:\n            self._cache[key] = value\n\n    async def delete(self, key):\n        async with self._lock:\n            if key in self._cache:\n                del self._cache[key]\n                return True\n            return False"
+                        solution_code="""import asyncio
+
+    class AsyncCache:
+    def __init__(self):
+        self._cache = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, key):
+        async with self._lock:
+            return self._cache.get(key)
+
+    async def set(self, key, value):
+        async with self._lock:
+            self._cache[key] = value
+
+    async def delete(self, key):
+        async with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+            return False"""
                     )
             elif agent == "critic":
                 # Simulate feedback that leads to improvement or success
@@ -249,9 +284,10 @@
                     is_loop, reason = await self.check_loop_condition(creator_res.solution_code, score)
                     if is_loop:
                         print(f"⚠ {reason}")
-                        # Фиксация тупикового состояния в истории для детерминированного хэша
-                        self.history_creator_solutions.append(creator_res.solution_code)
-                        self.scores_history.append(score)
+                        # If a loop is detected, we do NOT append the non-progressing solution to history.
+                        # The history should only reflect progressing solutions.
+                        # This also avoids storing duplicates if the creator re-generates the same code.
+
                         # Асинхронный запуск Docker-песочницы
                         sandbox_fact = await self._run_sandbox(creator_res.solution_code)
                         if "SECURITY_VIOLATION" in sandbox_fact:
@@ -259,10 +295,10 @@
                             return "Остановлено: Попытка взлома."
 
                         creator_input = f"КРИТИЧЕСКИЙ СБОЙ В СИМУЛЯЦИИ КОНТЕЙНЕРА: {sandbox_fact}.\nСмени парадигму кода!"
-                        continue
-
-                    self.history_creator_solutions.append(creator_res.solution_code)
-                    self.scores_history.append(score)
+                        continue # Continue to the next iteration without appending the current, looping solution
+                    else: # Only append if not a loop, meaning progress was made.
+                        self.history_creator_solutions.append(creator_res.solution_code)
+                        self.scores_history.append(score)
 
                     if score >= 0.95:
                         print("\n✅ УСПЕШНЫЙ ВЫХОД ИЗ ПЕТЛИ.")
