@@ -82,7 +82,7 @@
         Генерирует воспроизводимый 1536-мерный вектор на основе SHA-256 хэша текста.
         Разные тексты гарантированно дают разное косинусное сходство.
         """
-        hash_digest = hash-lib.sha256(text.encode('utf-8')).digest()
+        hash_digest = hashlib.sha256(text.encode('utf-8')).digest()
         # Используем хэш как сид для локального генератора случайных чисел
         seed = int.from_bytes(hash_digest[:4], byteorder='big')
         rng = np.random.default_rng(seed)
