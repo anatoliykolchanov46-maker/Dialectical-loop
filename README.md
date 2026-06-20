@@ -36,7 +36,7 @@
     import os
     import re
     import ast
-    import hash-lib
+    import hashlib
     import logging
     import asyncio
     import numpy as np
