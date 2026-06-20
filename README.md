@@ -33,7 +33,7 @@
 [VALIDATION_SCORE]: (Дробное число от 0.00 до 1.00)
 
 # =====================================================================
-    import os
+import os
 import re
 import ast
 import hashlib
@@ -233,8 +233,9 @@ class AsyncIndustrialOrchestrator:
             error_log = ce.stderr.decode('utf-8').strip()
             logging.info(f"Зафиксирована штатная ошибка выполнения в Docker: {error_log}")
 
-            # Проверяем, является ли ошибка OOMKilled
-            if "OOMKilled" in error_log or "memory" in error_log.lower():
+            # Проверяем, является ли ошибка OOMKilled, в том числе по пустому stderr и exit_status 137
+            if (not error_log and ce.exit_status == 137) or \
+               "OOMKilled" in error_log or "memory" in error_log.lower():
                 return "RESOURCE_VIOLATION: Memory limit exceeded! (OOMKilled)"
             # Можно добавить другие проверки для разных типов ошибок
             # elif "CPU limit" in error_log:
@@ -293,24 +294,7 @@ class AsyncIndustrialOrchestrator:
                 return CreatorResponseSchema(
                     version=3,
                     reflection="Финальное решение с полным асинхронным кэшем и локированием.",
-                    solution_code="""import asyncio\n\nclass AsyncCache:\n    def __init__(self):
-        self._cache = {}
-        self._lock = asyncio.Lock()
-
-    async def get(self, key):
-        async with self._lock:
-            return self._cache.get(key)
-
-    async def set(self, key, value):
-        async with self._lock:
-            self._cache[key] = value
-
-    async def delete(self, key):
-        async with self._lock:
-            if key in self._cache:
-                del self._cache[key]
-                return True
-            return False"""
+                    solution_code="""import asyncio\n\nclass AsyncCache:\n    def __init__(self):\n        self._cache = {}\n        self._lock = asyncio.Lock()\n\n    async def get(self, key):\n        async with self._lock:\n            return self._cache.get(key)\n\n    async def set(self, key, value):\n        async with self._lock:\n            self._cache[key] = value\n\n    async def delete(self, key):\n        async with self._lock:\n            if key in self._cache:\n                del self._cache[key]\n                return True\n            return False"""
                 )
         elif agent == "critic":
             # Simulate feedback that leads to improvement or success
@@ -377,7 +361,6 @@ async def main():
 if __name__ == "__main__":
     # Instead of asyncio.run(), use await main() directly in a Colab environment
     await main()
-   
     
 
 
