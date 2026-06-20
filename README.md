@@ -33,7 +33,7 @@
 [VALIDATION_SCORE]: (Дробное число от 0.00 до 1.00)
 
 # =====================================================================
-        import os
+    import os
     import re
     import ast
     import hashlib
