@@ -36,37 +36,37 @@
 4. Модификация Оркестратора для использования gRPC-клиента
 Теперь мы модифицируем класс AsyncIndustrialOrchestrator, чтобы его метод _run_sandbox вызывал gRPC-сервис вместо прямой работы с Docker-клиентом. Это позволит оркестратору общаться с внешним, полностью изолированным Docker-демоном через gRPC.
 ___
-import os
-import re
-import ast
-import hashlib
-import logging
-import asyncio
-import numpy as np
-from typing import List
-from pydantic import BaseModel, Field
-from openai import AsyncOpenAI
-import grpc
-import docker
-from docker.errors import ContainerError
+    import os
+    import re
+    import ast
+    import hashlib
+    import logging
+    import asyncio
+    import numpy as np
+    from typing import List
+    from pydantic import BaseModel, Field
+    from openai import AsyncOpenAI
+    import grpc
+    import docker
+    from docker.errors import ContainerError
 
 # Импортируем сгенерированные gRPC-файлы
-import sandbox_pb2
-import sandbox_pb2_grpc
+    import sandbox_pb2
+    import sandbox_pb2_grpc
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 
-class CreatorResponseSchema(BaseModel):
+    class CreatorResponseSchema(BaseModel):
     version: int = Field(description="Порядковый номер версии решения")
     reflection: str = Field(description="Краткий анализ замечаний оппонента")
     solution_code: str = Field(description="Чистый программный код или логический фреймворк")
 
-class CriticResponseSchema(BaseModel):
+    class CriticResponseSchema(BaseModel):
     vulnerabilities: List[str] = Field(description="Список обнаруженных уязвимостей и багов")
     validation_score: float = Field(description="Жесткая оценка качества от 0.00 до 1.00", ge=0.0, le=1.0)
     feedback_for_creator: str = Field(description="Инструкции по исправлению для Творца")
 
-class AsyncIndustrialOrchestrator:
+    class AsyncIndustrialOrchestrator:
     def __init__(self, max_iterations=5, similarity_threshold=0.92, sandbox_server_address='localhost:50051'):
         self.max_iterations = max_iterations
         self.similarity_threshold = similarity_threshold
@@ -342,12 +342,12 @@ class AsyncIndustrialOrchestrator:
 
 # Точка входа в асинхронное приложение
 
-async def main():
+    async def main():
     orchestrator = AsyncIndustrialOrchestrator(sandbox_server_address='localhost:50051') # Change address if your server is elsewhere
     result = await orchestrator.execute_loop("Спроектировать асинхронный кэш")
     print(f"\n🚀 СИСТЕМНЫЙ ВЫХОД ЯДРА:\n{result}")
 
-if __name__ == "__main__":
+    if __name__ == "__main__":
     await main()
 
 import os
