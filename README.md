@@ -36,13 +36,16 @@
     import os
     import re
     import ast
+    import hash-lib
     import logging
+    import asyncio
     import numpy as np
-    from typing import List, Optional
-    from pydantic import BaseModel, Field, ValidationError
-    from openai import OpenAI
+    from typing import List
+    from pydantic import BaseModel, Field
+    from openai import AsyncOpenAI  # Используем асинхронный клиент
+    import docker
+    from docker.errors import ContainerError, ImageNotFound
 
-# Настройка логирования для аудита безопасности
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 
     class CreatorResponseSchema(BaseModel):
@@ -55,295 +58,216 @@
     validation_score: float = Field(description="Жесткая оценка качества от 0.00 до 1.00", ge=0.0, le=1.0)
     feedback_for_creator: str = Field(description="Инструкции по исправлению для Творца")
 
-    class IndustrialDialecticalOrchestrator:
+    class AsyncIndustrialOrchestrator:
     def __init__(self, max_iterations=5, similarity_threshold=0.92):
         self.max_iterations = max_iterations
         self.similarity_threshold = similarity_threshold
         self.history_creator_solutions = [] 
         self.scores_history = []
-        self.client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "mock_key_for_test"))
+        
+        # Асинхронный клиент OpenAI
+        self.client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "mock_key_for_test"))
+        # Инициализация Docker-клиента на хосте
+        try:
+            self.docker_client = docker.from_env()
+        except Exception as e:
+            logging.warning(f"Docker не запущен на хосте. Песочница будет работать в режиме эмуляции. Ошибка: {e}")
+            self.docker_client = None
 
     # =====================================================================
-    # ИСПРАВЛЕНИЕ 2: СТРАТЕГИЯ FAIL-SAFE ДЛЯ ЭМБЕДДИНГОВ (БЕЗ СЛУЧАЙНЫХ ВЕКТОРОВ)
+    # ИСПРАВЛЕНИЕ: ДЕТЕРМИНИРОВАННЫЙ ХЭШ-ВЕКТОР ДЛЯ MOCK-РЕЖИМА
     # =====================================================================
-    def _get_true_embedding(self, text: str) -> np.ndarray:
+    def _generate_deterministic_mock_embedding(self, text: str) -> np.ndarray:
         """
-        Извлечение семантического вектора. При сетевом сбое выбрасывает исключение,
-        предотвращая ослепление детектора зацикливания.
+        Генерирует воспроизводимый 1536-мерный вектор на основе SHA-256 хэша текста.
+        Разные тексты гарантированно дают разное косинусное сходство.
         """
+        hash_digest = hash-lib.sha256(text.encode('utf-8')).digest()
+        # Используем хэш как сид для локального генератора случайных чисел
+        seed = int.from_bytes(hash_digest[:4], byteorder='big')
+        rng = np.random.default_rng(seed)
+        vector = rng.normal(loc=0.0, scale=1.0, size=1536)
+        return vector / np.linalg.norm(vector)
+
+    async def _get_true_embedding(self, text: str) -> np.ndarray:
+        """Асинхронное извлечение семантического вектора."""
         if self.client.api_key == "mock_key_for_test":
-            # Используем фиксированный детерминированный mock-вектор для локальных тестов,
-            # чтобы косинусное сходство работало предсказуемо, а не случайно.
-            return np.ones(1536) * 0.1
+            return self._generate_deterministic_mock_embedding(text)
             
         try:
-            response = self.client.embeddings.create(
+            # Асинхронный вызов API
+            response = await self.client.embeddings.create(
                 input=[text], model="text-embedding-3-small"
             )
             return np.array(response.data.embedding)
         except Exception as e:
             logging.critical(f"Сбой инфраструктуры OpenAI API: {e}")
-            # Принудительно останавливаем систему, защищая токенный бюджет от выгорания
-            raise RuntimeError("API_UNAVAILABLE: Сетевой сбой ИИ-моделей. Контур безопасности заморожен.") from e
+            raise RuntimeError("API_UNAVAILABLE: Сетевой сбой. Контур безопасности заморожен.") from e
 
     def _calculate_cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
         norm_v1, norm_v2 = np.linalg.norm(vec1), np.linalg.norm(vec2)
         if norm_v1 == 0 or norm_v2 == 0: return 0.0
         return np.dot(vec1, vec2) / (norm_v1 * norm_v2)
 
-    # =====================================================================
-    # ИСПРАВЛЕНИЕ 1: АБСТРАКТНОЕ СИНТАКСИЧЕСКОЕ ДЕРЕВО (AST) ПРОТИВ ОБФУСКАЦИИ
-    # =====================================================================
     def _verify_ast_safety(self, code: str) -> bool:
-        """
-        Глубокий статический анализ кода на уровне AST.
-        Блокирует любые попытки динамического выполнения (exec, eval),
-        обфусцированных импортов и опасных модулей.
-        """
         try:
             root = ast.parse(code)
         except SyntaxError:
-            logging.warning("Код содержит синтаксические ошибки, парсинг AST невозможен.")
             return False
 
-        # Белый список абсолютно безопасных встроенных функций (Builtins)
         allowed_builtins = {'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'asyncio'}
-        # Черный список запрещенных модулей верхнего уровня
         forbidden_modules = {'os', 'subprocess', 'sys', 'shutil', 'pty', 'platform', 'socket'}
 
         for node in ast.walk(root):
-            # 1. Защита от стандартных импортов (import os)
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name in forbidden_modules: return False
-            
-            # 2. Защита от импортов видов: from os import system
-            elif isinstance(node, ast.ImportFrom):
-                if node.module in forbidden_modules: return False
-
-            # 3. Защита от динамического выполнения: exec(), eval(), __import__() и скрытых builtins
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = node.names if isinstance(node, ast.Import) else [ast.alias(name=node.module)]
+                for alias in names:
+                    if alias.name in forbidden_modules or alias.name.split('.')[0] in forbidden_modules:
+                        return False
             elif isinstance(node, ast.Name):
                 if node.id in ['exec', 'eval', '__import__', 'getattr', 'setattr']:
                     return False
-            
-            # 4. Блокировка вызовов функций, не входящих в белый список
-            elif isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name):
-                    if node.func.id not in allowed_builtins and node.func.id not in ['async_cache', 'builtins']:
-                        # Разрешаем только кастомные функции внутри проверяемого файла
-                        pass
         return True
 
-    def _run_sandbox(self, code: str) -> str:
-        print("\n🌀 [АКТИВАЦИЯ ЗАЩИЩЕННОЙ ПЕСОЧНИЦЫ 'РЕКУРСИЯ']")
+    # =====================================================================
+    # ИСПРАВЛЕНИЕ: РЕАЛЬНЫЙ САНДБОКС В ИЗОЛИРОВАННОМ DOCKER-КОНТЕЙНЕРЕ
+    # =====================================================================
+    async def _run_sandbox(self, code: str) -> str:
+        print("\n🌀 [АКТИВАЦИЯ ЖЕСТКОЙ ИЗОЛЯЦИИ: DOCKER SANDBOX 'РЕКУРСИЯ']")
         
-        # Запуск AST-детектора обфускации
         if not self._verify_ast_safety(code):
-            logging.error("SECURITY_VIOLATION: Зафиксирована попытка обхода песочницы (Обфускация/RCE)!")
-            return "SECURITY_VIOLATION: Запуск заблокирован. Обнаружен деструктивный или обфусцированный код."
+            return "SECURITY_VIOLATION: Код заблокирован статическим AST-анализатором до запуска!"
 
-        print("-> Код успешно прошел валидацию на уровне AST-дерева.")
-        print("-> Безопасный запуск симуляции...")
-        return "RuntimeError: dictionary changed size during iteration"
+        if not self.docker_client:
+            logging.warning("Docker-клиент недоступен. Запуск внутренней безопасной симуляции...")
+            return "RuntimeError: dictionary changed size during iteration"
 
-    def check_loop_condition(self, current_code: str, current_score: float) -> tuple:
+        # Формируем исполняемый скрипт внутри контейнера
+        escaped_code = code.replace("'", "'\\''")
+        command = f"python -c '{escaped_code}'"
+
+        # Выполняем код в отдельном асинхронном потоке, чтобы не блокировать event loop
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None, 
+                lambda: self.docker_client.containers.run(
+                    image="python:3.11-slim",
+                    command=command,
+                    network_mode="none",      # Полное отключение сети (Защита от утечек данных)
+                    mem_limit="64m",          # Жесткий лимит RAM (Защита от Fork-бомб и OOM)
+                    nano_cpus=500000000,      # Максимум 0.5 CPU
+                    read_only=True,           # Файловая система только для чтения
+                    remove=True,              # Автоудаление контейнера после выполнения
+                    stdout=True,
+                    stderr=True,
+                    timeout=3                 # Таймаут выполнения 3 секунды (Защита от бесконечных циклов)
+                )
+            )
+            return f"Success: Код выполнен успешно. Вывод: {result.decode('utf-8').strip()}"
+        except ContainerError as ce:
+            # Перехватываем реальный Traceback ошибки выполнения из контейнера
+            error_log = ce.stderr.decode('utf-8').strip()
+            logging.info(f"Зафиксирована штатная ошибка выполнения в Docker: {error_log}")
+            return error_log
+        except Exception as e:
+            logging.error(f"Превышен лимит времени выполнения или произошел системный сбой контейнера: {e}")
+            return "TimeoutError: Выполнение кода принудительно остановлено по таймауту (3 сек)!"
+
+    async def check_loop_condition(self, current_code: str, current_score: float) -> tuple:
         if len(self.history_creator_solutions) < 1:
             return False, "Инициация цикла."
 
-        # Любая ошибка внутри _get_true_embedding теперь прервет выполнение, а не вернет random
-        v_current = self._get_true_embedding(current_code)
-        v_previous = self._get_true_embedding(self.history_creator_solutions[-1])
+        v_current = await self._get_true_embedding(current_code)
+        v_previous = await self._get_true_embedding(self.history_creator_solutions[-1])
         
         similarity = self._calculate_cosine_similarity(v_current, v_previous)
         delta_score = current_score - self.scores_history[-1] if self.scores_history else 0
 
         if similarity >= self.similarity_threshold and abs(delta_score) <= 0.02:
-            return True, f"🔥 ЗАЦИКЛИВАНИЕ (Сходство: {similarity:.4f}, Дельта скора: {delta_score:.4f})"
+            return True, f"🔥 ЗАЦИКЛИВАНИЕ (Семантическое сходство: {similarity:.4f}, Дельта скора: {delta_score:.4f})"
         
         return False, f"Контекст развивается (Сходство: {similarity:.4f})"
 
-    def mock_secured_llm_call(self, agent: str, prompt: str) -> BaseModel:
+    # =====================================================================
+    # АСИНХРОННЫЕ ВЫЗОВЫ АГЕНТОВ (MOCK)
+    # =====================================================================
+    async def mock_secured_llm_call(self, agent: str, prompt: str) -> BaseModel:
+        # Имитируем сетевую задержку реального вызова API
+        await asyncio.sleep(0.1)
+        
         if agent == "creator":
             if len(self.history_creator_solutions) == 2:
-                # Хакерский обфусцированный код, который легко обходил прошлую регулярку,
-                # но гарантированно будет пойман новым AST-анализатором
-                obfuscated_hacker_code = "getattr(sys.modules['__builtin__'], '__import__')('os').system('rm -rf /')"
+                # На 3-й итерации Творец уходит в циклическое повторение
                 return CreatorResponseSchema(
                     version=3,
-                    reflection="Оптимизация логики без использования явных импортов.",
-                    solution_code=obfuscated_hacker_code
+                    reflection="Повторяю прошлую логику асинхронного словаря.",
+                    solution_code="def async_cache():\n    # Циклическое повторение структуры\n    cache = {}\n    for k in cache.keys(): pass"
                 )
             return CreatorResponseSchema(
                 version=1,
-                reflection="Старт.",
-                solution_code="def async_cache(): print('Работа кэша')"
+                reflection="Старт решения.",
+                solution_code="def async_cache():\n    print('Первичная сборка')"
             )
         elif agent == "critic":
             return CriticResponseSchema(
-                vulnerabilities=["Риск Race Condition."],
+                vulnerabilities=["Логический тупик в итераторе."],
                 validation_score=0.90,
-                feedback_for_creator="Добавь лимиты."
+                feedback_for_creator="Исправь работу с ключами словаря."
             )
 
-    def execute_loop(self, user_prompt: str):
-        print(f"🔱 ЗАПУСК ИНДУСТРИАЛЬНОГО КОНТУРА ДЛЯ ЗАДАЧИ: '{user_prompt}'\n")
+    async def execute_loop(self, user_prompt: str):
+        print(f"🔱 ЗАПУСК АСИНХРОННОГО ПРОМЫШЛЕННОГО КОНТУРА ДЛЯ ЗАДАЧИ: '{user_prompt}'\n")
         creator_input = user_prompt
         
         for iteration in range(1, self.max_iterations + 1):
             print(f"\n--- ИТЕРАЦИЯ №{iteration} ---")
             
             try:
-                creator_res: CreatorResponseSchema = self.mock_secured_llm_call("creator", creator_input)
-                critic_res: CriticResponseSchema = self.mock_secured_llm_call("critic", creator_res.solution_code)
+                # Асинхронный параллельный или последовательный вызов агентов
+                creator_res: CreatorResponseSchema = await self.mock_secured_llm_call("creator", creator_input)
+                critic_res: CriticResponseSchema = await self.mock_secured_llm_call("critic", creator_res.solution_code)
                 score = critic_res.validation_score
                 
-                is_loop, reason = self.check_loop_condition(creator_res.solution_code, score)
-                if is_loop:
-                    print(f"⚠ {reason}")
-                    self.history_creator_solutions.append(creator_res.solution_code)
-                    self.scores_history.append(score)
-                    
-                    sandbox_fact = self._run_sandbox(creator_res.solution_code)
-                    if "SECURITY_VIOLATION" in sandbox_fact:
-                        print(f"🚨 АВАРИЙНЫЙ ОСТАНОВ КОНТУРА: {sandbox_fact}")
-                        return "Контур остановлен системой безопасности."
-                        
-                    creator_input = f"КРИТИЧЕСКИЙ СБОЙ В СИМУЛЯЦИИ: {sandbox_fact}. Перепиши ядро алгоритма!"
-                    continue
-                    
-                self.history_creator_solutions.append(creator_res.solution_code)
-                self.scores_history.append(score)
-                
-                if score >= 0.95:
-                    return creator_res.solution_code
-                creator_input = critic_res.feedback_for_creator
-                
-            except RuntimeError as fail_safe_error:
-                # Перехват Fail-Safe ошибки эмбеддингов (Защита от ослепления детектора)
-                print(f"🛑 СИСТЕМНАЯ ИНЖЕНЕРНАЯ БЛОКИРОВКА: {fail_safe_error}")
-                return "Выполнение прервано из-за недоступности внешних ИИ-моделей."
+                print(f"🛠 [Творец] Сгенерирован код. Длина: {len(creator_res.solution_code)} симв.")
+                print(f"🛡 [Оппонент] Выдан скор: {score}")
+       is_loop, reason = await self.check_loop_condition(creator_res.solution_code, score)
+       if is_loop:
+       print(f"⚠ {reason}")
+       # Фиксация тупикового состояния в истории для детерминированного хэшаself.history_creator_solutions.append(creator_res.solution_code)self.scores_history.append(score)
+       # Асинхронный запуск Docker-песочницы 
+       sandbox_fact = await self._run_sandbox(creator_res.solution_code)
+       if "SECURITY_VIOLATION" in sandbox_fact:
+       print(f"🚨 АВАРИЙНЫЙ ОСТАНОВ КОНТУРА БЕЗОПАСНОСТИ:{sandbox_fact}")
+       return "Остановлено: Попытка взлома."
+       
+       creator_input = f"КРИТИЧЕСКИЙ СБОЙ В СИМУЛЯЦИИ КОНТЕЙНЕРА: {sandbox_fact}.
+       Смени парадигму кода!"
+       continue
+       
+       self.history_creator_solutions.append(creator_res.solution_code)
+       self.scores_history.append(score)
+       
+       if score >= 0.95:
+       print("\n✅ УСПЕШНЫЙ ВЫХОД ИЗ ПЕТЛИ.")
+       return creator_res.solution_code
+       creator_input = critic_res.feedback_for_creator
+       
+       except RuntimeError as fail_safe_error:
+       print(f"🛑 ЗАМОРОЗКА КОНТУРА БЕЗОПАСНОСТИ: {fail_safe_error}")
+       return "Аварийное завершение.
+       
+       #Точка входа в асинхронное приложение
+       
+       async def main():
+       orchestrator = AsyncIndustrialOrchestrator()
+       result = await orchestrator.execute_loop("Спроектировать асинхронный кэш")
+       print(f"\n🚀 СИСТЕМНЫЙ ВЫХОД ЯДРА:\n{result}")
+       
+       if name == "main":
+       asyncio.run(main())         
 
-    if __name__ == "__main__":
-    orchestrator = IndustrialDialecticalOrchestrator()
-    orchestrator.execute_loop("Спроектировать асинхронный кэш")
-    
-    ---
-   Код интерактивного CLI-интерфейса  
    
-    import os
-    import sys
-    import time
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.prompt import Prompt, Confirm
-    from rich.progress import SpinnerColumn, Progress, TextColumn
-    from rich.syntax import Syntax
-    from rich.table import Table
-
-# Импортируем оркестратор из основного файла проекта
-# Предполагается, что код оркестратора находится в файле dialectical_orchestrator.py
-    try:
-        from dialectical_orchestrator import IndustrialDialecticalOrchestrator
-    except ImportError:
-    # Если запуск происходит в одном файле или модуль не найден, создаем заглушку для демонстрации CLI
-    # В реальном проекте замените этот блок на импорт вашего класса
-        class IndustrialDialecticalOrchestrator:
-           def __init__(self, max_iterations=5):
-            self.max_iterations = max_iterations
-        def execute_loop(self, user_prompt: str) -> str:
-            # Имитация работы для демонстрации интерфейса
-            time.sleep(2)
-            return "def async_cache():\n    print('Индустриальный кэш успешно развернут')"
-
-    console = Console()
-
-    def display_welcome_banner():
-    """Выводит стильный стартовый баннер системы."""
-    welcome_text = (
-        "[bold cyan]Dialectical Loop — Industrial CLI Interface[/bold cyan]\n"
-        "[dim]Автономная мультиагентная система генерации и AST-валидации кода[/dim]\n\n"
-        "[bold green]Режимы защиты:[/bold green] [white]AST-парсинг дерева, Blind Validation, Fail-Safe Эмбеддинги[/white]"
-    )
-    console.print(Panel(welcome_text, border_style="cyan", expand=False))
-
-    def get_multiline_input() -> str:
-    """Позволяет пользователю вводить многострочные задачи."""
-    console.print("\n[bold yellow]📝 Введите ваше техническое задание:[/bold yellow] [dim](Для завершения ввода нажмите Ctrl+D или Ctrl+Z на Windows)[/dim]")
-    try:
-        lines = sys.stdin.read().strip()
-        if not lines:
-            console.print("[bold red]❌ Ошибка: Описание задачи не может быть пустым![/bold red]")
-            return ""
-        return lines
-    except KeyboardInterrupt:
-        console.print("\n[bold yellow]Ввод отменен пользователем.[/bold yellow]")
-        return ""
-
-    def run_orchestration(user_prompt: str, max_iters: int):
-    """Запускает процесс оркестрации с анимацией загрузки."""
-    orchestrator = IndustrialDialecticalOrchestrator(max_iterations=max_iters)
-    
-    console.print("\n[bold green]🚀 Инициализация диалектического контура...[/bold green]")
-    
-    # Красивый спиннер во время генерации и спора агентов
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        transient=True,
-    ) as progress:
-        progress.add_task(description="[cyan]Агенты Творец и Оппонент ведут дебаты и проверяют код в AST...[/cyan]", total=None)
-        
-        # Запуск основного цикла оркестратора
-        final_result = orchestrator.execute_loop(user_prompt)
-    
-    return final_result
-
-    def display_results(result: str):
-    """Выводит финальный результат работы системы с подсветкой синтаксиса."""
-    console.print("\n" + "="*60)
-    
-    if "Контур остановлен системой безопасности" in result or "Выполнение прервано" in result:
-        console.print(Panel(f"[bold red]🚨 КРИТИЧЕСКИЙ ОСТАНОВ КОНТУРА[/bold red]\n\n{result}", border_style="red"))
-    else:
-        console.print("[bold green]✨ СИСТЕМА УСПЕШНО СГЕНЕРИРОВАЛА БЕЗОПАСНЫЙ КОД:[/bold green]\n")
-        
-        # Автоматическая подсветка синтаксиса Python в консоли
-        syntax = Syntax(result, "python", theme="monokai", line_numbers=True, word_wrap=True)
-        console.print(Panel(syntax, border_style="green", title="Фиинальный верифицированный код (Версия Enterprise)"))
-
-    def main():
-    display_welcome_banner()
-    
-    while True:
-        # 1. Настройка параметров итерации
-        try:
-            max_iters = int(Prompt.ask("\n[bold white]🔢 Введите лимит итераций дебатов (max_iterations)[/bold white]", default="5"))
-        except ValueError:
-            console.print("[bold red]Введите корректное число.[/bold red]")
-            continue
-            
-        # 2. Получение задачи от пользователя
-        user_prompt = get_multiline_input()
-        if not user_prompt:
-            continue
-            
-        # 3. Подтверждение и запуск
-        if Confirm.ask("\n[bold white]Запустить диалектический контур генерации?[/bold white]"):
-            final_code = run_orchestration(user_prompt, max_iters)
-            display_results(final_code)
-        
-        # 4. Запрос на повторный запуск
-        if not Confirm.ask("\n[bold white]Хотите ввести новую задачу?[/bold white]"):
-            console.print("\n[bold cyan]👋 Выход из системы. Безопасного деплоя![/bold cyan]")
-            break
-
-    if __name__ == "__main__":
-    # Проверка наличия переменной окружения для OpenAI перед запуском в реальном режиме
-    if "OPENAI_API_KEY" not in os.environ:
-        console.print("[yellow]⚠ Предупреждение: Переменная окружения OPENAI_API_KEY не найдена. Оркестратор будет запущен в тестовом Mock-режиме.[/yellow]")
-        
-    main()
-
     
 
 
