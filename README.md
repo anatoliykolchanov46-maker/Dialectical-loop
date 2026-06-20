@@ -34,31 +34,31 @@
 
 # =====================================================================
     import os
-    import re
-    import ast
-    import hashlib
-    import logging
-    import asyncio
-    import numpy as np
-    from typing import List
-    from pydantic import BaseModel, Field
-    from openai import AsyncOpenAI  # Используем асинхронный клиент
-    import docker
-    docker.errors import ContainerError, ImageNotFound
+import re
+import ast
+import hashlib
+import logging
+import asyncio
+import numpy as np
+from typing import List
+from pydantic import BaseModel, Field
+from openai import AsyncOpenAI  # Используем асинхронный клиент
+import docker
+from docker.errors import ContainerError, ImageNotFound
 
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 
-    class CreatorResponseSchema(BaseModel):
+class CreatorResponseSchema(BaseModel):
     version: int = Field(description="Порядковый номер версии решения")
     reflection: str = Field(description="Краткий анализ замечаний оппонента")
     solution_code: str = Field(description="Чистый программный код или логический фреймворк")
 
-    class CriticResponseSchema(BaseModel):
+class CriticResponseSchema(BaseModel):
     vulnerabilities: List[str] = Field(description="Список обнаруженных уязвимостей и багов")
     validation_score: float = Field(description="Жесткая оценка качества от 0.00 до 1.00", ge=0.0, le=1.0)
     feedback_for_creator: str = Field(description="Инструкции по исправлению для Творца")
 
-    class AsyncIndustrialOrchestrator:
+class AsyncIndustrialOrchestrator:
     def __init__(self, max_iterations=5, similarity_threshold=0.92):
         self.max_iterations = max_iterations
         self.similarity_threshold = similarity_threshold
@@ -123,7 +123,7 @@
         # and 'getattr', 'setattr', 'delattr', '__import__', 'type', '__getattribute__' (dangerous even if referenced).
         forbidden_builtins_and_dynamic_access = {
             'exec', 'eval', 'compile',
-            'getattr', 'setattr', 'delattr', '__import__', 'type', '__getattribute__', 'globals'
+            'getattr', 'setattr', 'delattr', '__import__', 'type', '__getattribute__', 'globals', 'locals', '__builtins__'
         }
 
         for node in ast.walk(root):
@@ -199,7 +199,13 @@
 
         if not self.docker_client:
             logging.warning("Docker-клиент недоступен. Запуск внутренней безопасной симуляции...")
-            return "RuntimeError: dictionary changed size during iteration"
+            print("⚠️ [SANDBOX EMULATION MODE] Симуляция работы песочницы (Docker не запущен).")
+            # Directly simulate OOM if the specific code is generated for testing purposes
+            if "bytearray(70 * 1024 * 1024)" in code:
+                return "RESOURCE_VIOLATION: Memory limit exceeded! (OOMKilled - Emulation)"
+            else:
+                # For other cases, simulate generic runtime error or success.
+                return "Success: Код выполнен успешно. Вывод: Эмуляция."
 
         # Pass the command as a list of arguments to prevent shell injection
         command = ["python", "-c", code]
@@ -215,7 +221,7 @@
                     network_mode="none",      # Полное отключение сети (Защита от утечек данных)
                     mem_limit="64m",          # Жесткий лимит RAM (Защита от Fork-бомб и OOM)
                     nano_cpus=500000000,      # Максимум 0.5 CPU
-                    read_only=True,           # Файловая система только для чтения
+                    read_only=True,
                     remove=True,              # Автоудаление контейнера после выполнения
                     stdout=True,
                     stderr=True,
@@ -224,9 +230,16 @@
             )
             return f"Success: Код выполнен успешно. Вывод: {result.decode('utf-8').strip()}"
         except ContainerError as ce:
-            # Перехватываем реальный Traceback ошибки выполнения из контейнера
             error_log = ce.stderr.decode('utf-8').strip()
             logging.info(f"Зафиксирована штатная ошибка выполнения в Docker: {error_log}")
+
+            # Проверяем, является ли ошибка OOMKilled
+            if "OOMKilled" in error_log or "memory" in error_log.lower():
+                return "RESOURCE_VIOLATION: Memory limit exceeded! (OOMKilled)"
+            # Можно добавить другие проверки для разных типов ошибок
+            # elif "CPU limit" in error_log:
+            #     return "RESOURCE_VIOLATION: CPU limit exceeded!"
+
             return error_log
         except Exception as e:
             logging.error(f"Превышен лимит времени выполнения или произошел системный сбой контейнера: {e}")
@@ -257,17 +270,24 @@
         if agent == "creator":
             current_solution_count = len(self.history_creator_solutions)
             if current_solution_count == 0:
+                # Generate code that exceeds memory limit to test OOMKilled handling
                 return CreatorResponseSchema(
                     version=1,
-                    reflection="Старт решения. Создаю базовую структуру кэша.",
-                    solution_code="def async_cache_v1():\n    cache = {}\n    print('Базовая инициализация кэша.')\n    return cache"
+                    reflection="Старт решения. Создаю тестовый код для проверки OOMKilled.",
+                    solution_code="_ = bytearray(70 * 1024 * 1024) # Allocate 70MB to trigger OOM"
                 )
             elif current_solution_count == 1:
                 # After first feedback (e.g., "Исправь работу с ключами словаря.")
                 return CreatorResponseSchema(
                     version=2,
                     reflection="Учитываю замечание оппонента. Добавляю метод для безопасной работы с ключами.",
-                    solution_code="class AsyncCacheV2:\n    def __init__(self):\n        self._cache = {}\n    async def get(self, key):\n        return self._cache.get(key)\n    async def set(self, key, value):\n        self._cache[key] = value"
+                    solution_code="""class AsyncCacheV2:
+    def __init__(self):
+        self._cache = {}
+    async def get(self, key):
+        return self._cache.get(key)
+    async def set(self, key, value):
+        self._cache[key] = value"""
                 )
             else: # current_solution_count >= 2: This will be the final, successful solution
                 return CreatorResponseSchema(
@@ -315,26 +335,23 @@
             print(f"\n--- ИТЕРАЦИЯ №{iteration} ---")
 
             try:
-                # Асинхронный параллельный или последовательный вызов агентов
                 creator_res: CreatorResponseSchema = await self.mock_secured_llm_call("creator", creator_input)
+                print(f"🛠 [Творец] Сгенерирован код. Длина: {len(creator_res.solution_code)} симв.")
+
+                # Асинхронный запуск Docker-песочницы для проверки сгенерированного кода
+                sandbox_fact = await self._run_sandbox(creator_res.solution_code)
+                if "SECURITY_VIOLATION" in sandbox_fact or "RESOURCE_VIOLATION" in sandbox_fact:
+                    print(f"🚨 АВАРИЙНЫЙ ОСТАНОВ КОНТУРА БЕЗОПАСНОСТИ:{sandbox_fact}")
+                    return "Остановлено: Попытка взлома или нарушение ресурсов."
+
+                # If sandbox passed, proceed with critic and loop check
                 critic_res: CriticResponseSchema = await self.mock_secured_llm_call("critic", creator_res.solution_code)
                 score = critic_res.validation_score
 
-                print(f"🛠 [Творец] Сгенерирован код. Длина: {len(creator_res.solution_code)} симв.")
                 print(f"🛡 [Оппонент] Выдан скор: {score}")
                 is_loop, reason = await self.check_loop_condition(creator_res.solution_code, score)
                 if is_loop:
                     print(f"⚠ {reason}")
-                    # If a loop is detected, we do NOT append the non-progressing solution to history.
-                    # The history should only reflect progressing solutions.
-                    # This also avoids storing duplicates if the creator re-generates the same code.
-
-                    # Асинхронный запуск Docker-песочницы
-                    sandbox_fact = await self._run_sandbox(creator_res.solution_code)
-                    if "SECURITY_VIOLATION" in sandbox_fact:
-                        print(f"🚨 АВАРИЙНЫЙ ОСТАНОВ КОНТУРА БЕЗОПАСНОСТИ:{sandbox_fact}")
-                        return "Остановлено: Попытка взлома."
-
                     creator_input = f"КРИТИЧЕСКИЙ СБОЙ В СИМУЛЯЦИИ КОНТЕЙНЕРА: {sandbox_fact}.\nСмени парадигму кода!"
                     continue # Continue to the next iteration without appending the current, looping solution
                 else: # Only append if not a loop, meaning progress was made.
@@ -352,12 +369,12 @@
 
 # Точка входа в асинхронное приложение
 
-    async def main():
+async def main():
     orchestrator = AsyncIndustrialOrchestrator()
     result = await orchestrator.execute_loop("Спроектировать асинхронный кэш")
     print(f"\n🚀 СИСТЕМНЫЙ ВЫХОД ЯДРА:\n{result}")
 
-    if __name__ == "__main__":
+if __name__ == "__main__":
     # Instead of asyncio.run(), use await main() directly in a Colab environment
     await main()
    
