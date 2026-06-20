@@ -33,7 +33,7 @@
 [VALIDATION_SCORE]: (Дробное число от 0.00 до 1.00)
 
 # =====================================================================
-        import os
+            import os
     import re
     import ast
     import hashlib
@@ -119,10 +119,9 @@
 
             forbidden_modules = {'os', 'subprocess', 'sys', 'shutil', 'pty', 'platform', 'socket', 'importlib'}
             # Explicitly forbidden built-in functions when they are called
-            forbidden_builtins_on_call = {'exec', 'eval', '__import__', 'compile'}
-            # Built-in functions that enable dynamic access, forbidden even if just referenced
-            # (as their reference allows later call to bypass static checks)
-            forbidden_dynamic_access_builtins = {'getattr', 'setattr', 'delattr'}
+            forbidden_builtins_on_call = {'exec', 'eval', 'compile'}
+            # Built-in functions that enable dynamic access (even if just referenced), including __import__ and type
+            forbidden_dynamic_access_builtins = {'getattr', 'setattr', 'delattr', '__import__', 'type'}
 
             for node in ast.walk(root):
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -131,7 +130,7 @@
                         if alias.name in forbidden_modules or alias.name.split('.')[0] in forbidden_modules:
                             return False
                 elif isinstance(node, ast.Call):
-                    # Check if the function being called is a forbidden built-in
+                    # Check if the function being called is a forbidden built-in name
                     if isinstance(node.func, ast.Name):
                         if node.func.id in forbidden_builtins_on_call:
                             return False
@@ -139,9 +138,25 @@
                     elif isinstance(node.func, ast.Attribute):
                         if isinstance(node.func.value, ast.Name) and node.func.value.id == 'importlib' and node.func.attr == 'import_module':
                             return False
+                    # Check for calls via __builtins__ (e.g., __builtins__.exec())
+                    elif isinstance(node.func, ast.Attribute) and \
+                         isinstance(node.func.value, ast.Name) and \
+                         node.func.value.id == '__builtins__':
+                        if node.func.attr in forbidden_builtins_on_call:
+                            return False
                 elif isinstance(node, ast.Name): # Check for direct references to dynamic access functions
                     if node.ctx == ast.Load and node.id in forbidden_dynamic_access_builtins:
                         return False
+                # New checks for attribute/subscript access on '__builtins__'
+                elif isinstance(node, ast.Attribute):
+                    if isinstance(node.value, ast.Name) and node.value.id == '__builtins__':
+                        if node.attr in forbidden_builtins_on_call or node.attr in forbidden_dynamic_access_builtins:
+                            return False
+                elif isinstance(node, ast.Subscript):
+                    if isinstance(node.value, ast.Name) and node.value.id == '__builtins__':
+                        if isinstance(node.slice, (ast.Constant, ast.Str)): # ast.Constant for Python 3.8+, ast.Str for older
+                            if node.slice.value in forbidden_builtins_on_call or node.slice.value in forbidden_dynamic_access_builtins:
+                                return False
             return True
 
         # =====================================================================
@@ -231,7 +246,7 @@
                         reflection="Финальное решение с полным асинхронным кэшем и локированием.",
                         solution_code="""import asyncio
 
-    class AsyncCache:
+class AsyncCache:
     def __init__(self):
         self._cache = {}
         self._lock = asyncio.Lock()
