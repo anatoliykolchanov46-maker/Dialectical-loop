@@ -33,7 +33,7 @@
 [VALIDATION_SCORE]: (Дробное число от 0.00 до 1.00)
 
 # =====================================================================
-    import os
+        import os
     import re
     import ast
     import hashlib
@@ -142,9 +142,8 @@
                 logging.warning("Docker-клиент недоступен. Запуск внутренней безопасной симуляции...")
                 return "RuntimeError: dictionary changed size during iteration"
 
-            # Формируем исполняемый скрипт внутри контейнера
-            escaped_code = code.replace("'", "'\''")
-            command = f"python -c '{escaped_code}'"
+            # Pass the command as a list of arguments to prevent shell injection
+            command = ["python", "-c", code]
 
             # Выполняем код в отдельном асинхронном потоке, чтобы не блокировать event loop
             loop = asyncio.get_running_loop()
@@ -197,24 +196,40 @@
             await asyncio.sleep(0.1)
 
             if agent == "creator":
-                if len(self.history_creator_solutions) == 2:
-                    # На 3-й итерации Творец уходит в циклическое повторение
+                current_solution_count = len(self.history_creator_solutions)
+                if current_solution_count == 0:
+                    return CreatorResponseSchema(
+                        version=1,
+                        reflection="Старт решения. Создаю базовую структуру кэша.",
+                        solution_code="def async_cache_v1():\n    cache = {}\n    print('Базовая инициализация кэша.')\n    return cache"
+                    )
+                elif current_solution_count == 1:
+                    # After first feedback (e.g., "Исправь работу с ключами словаря.")
+                    return CreatorResponseSchema(
+                        version=2,
+                        reflection="Учитываю замечание оппонента. Добавляю метод для безопасной работы с ключами.",
+                        solution_code="class AsyncCacheV2:\n    def __init__(self):\n        self._cache = {}\n    async def get(self, key):\n        return self._cache.get(key)\n    async def set(self, key, value):\n        self._cache[key] = value"
+                    )
+                else: # current_solution_count >= 2: This will be the final, successful solution
                     return CreatorResponseSchema(
                         version=3,
-                        reflection="Повторяю прошлую логику асинхронного словаря.",
-                        solution_code="def async_cache():\n    # Циклическое повторение структуры\n    cache = {}\n    for k in cache.keys(): pass"
+                        reflection="Финальное решение с полным асинхронным кэшем и локированием.",
+                        solution_code="import asyncio\n\nclass AsyncCache:\n    def __init__(self):\n        self._cache = {}\n        self._lock = asyncio.Lock()\n\n    async def get(self, key):\n        async with self._lock:\n            return self._cache.get(key)\n\n    async def set(self, key, value):\n        async with self._lock:\n            self._cache[key] = value\n\n    async def delete(self, key):\n        async with self._lock:\n            if key in self._cache:\n                del self._cache[key]\n                return True\n            return False"
                     )
-                return CreatorResponseSchema(
-                    version=1,
-                    reflection="Старт решения.",
-                    solution_code="def async_cache():\n    print('Первичная сборка')"
-                )
             elif agent == "critic":
-                return CriticResponseSchema(
-                    vulnerabilities=["Логический тупик в итераторе."],
-                    validation_score=0.90,
-                    feedback_for_creator="Исправь работу с ключами словаря."
-                )
+                # Simulate feedback that leads to improvement or success
+                if len(self.history_creator_solutions) < 2:
+                    return CriticResponseSchema(
+                        vulnerabilities=["Логический тупик в итераторе.", "Отсутствие асинхронной безопасности."],
+                        validation_score=0.90,
+                        feedback_for_creator="Исправь работу с ключами словаря и добавь асинхронные примитивы безопасности."
+                    )
+                else:
+                    return CriticResponseSchema(
+                        vulnerabilities=[],
+                        validation_score=0.98, # High score to indicate success and break the loop
+                        feedback_for_creator="Отличное решение! Асинхронный кэш реализован корректно и безопасно."
+                    )
 
         async def execute_loop(self, user_prompt: str):
             print(f"🔱 ЗАПУСК АСИНХРОННОГО ПРОМЫШЛЕННОГО КОНТУРА ДЛЯ ЗАДАЧИ: '{user_prompt}'\n")
@@ -266,7 +281,8 @@
         print(f"\n🚀 СИСТЕМНЫЙ ВЫХОД ЯДРА:\n{result}")
 
     if __name__ == "__main__":
-        asyncio.run(main())
+        # Instead of asyncio.run(), use await main() directly in a Colab environment
+        await main()
    
     
 
