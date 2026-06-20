@@ -32,6 +32,8 @@
 [СПИСОК ОШИБОК ДЛЯ ИСПРАВЛЕНИЯ]: (Пункт 1, Пункт 2...)
 [VALIDATION_SCORE]: (Дробное число от 0.00 до 1.00)
 ---
+
+
 import os
 import re
 import numpy as np
